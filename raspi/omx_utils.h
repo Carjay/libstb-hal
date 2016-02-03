@@ -57,6 +57,11 @@ struct omx_cmd_t
   OMX_PTR pCmdData;
 };
 
+struct omx_bufferdesc_t {
+    OMX_BUFFERHEADERTYPE *pHeader;
+    int state; /* 0 = free, 1 = busy */
+};
+
 struct omx_component_t
 {
   OMX_HANDLETYPE h;
@@ -71,7 +76,8 @@ struct omx_component_t
   /* Pointer to parent pipeline */
   struct omx_pipeline_t* pipe;
 
-  OMX_BUFFERHEADERTYPE *buffers;
+  int buffercount;
+  struct omx_bufferdesc_t *bufferdesc;
   int port_settings_changed;
   int config_changed;
 
@@ -114,7 +120,6 @@ OMX_ERRORTYPE omx_send_command_and_wait(struct omx_component_t* component, OMX_C
 OMX_ERRORTYPE omx_send_command_and_wait0(struct omx_component_t* component, OMX_COMMANDTYPE Cmd, OMX_U32 nParam, OMX_PTR pCmdData);
 OMX_ERRORTYPE omx_send_command_and_wait1(struct omx_component_t* component, OMX_COMMANDTYPE Cmd, OMX_U32 nParam, OMX_PTR pCmdData);
 void omx_clock_set_speed(struct omx_component_t *clock, int v);
-void summarise_buffers(OMX_BUFFERHEADERTYPE *buffers);
 int omx_get_free_buffer_count(struct omx_component_t* component);
 void omx_alloc_buffers(struct omx_component_t *component, int port);
 OMX_TICKS pts_to_omx(uint64_t pts);

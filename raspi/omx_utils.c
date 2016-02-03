@@ -291,13 +291,22 @@ static OMX_ERRORTYPE omx_empty_buffer_done(__attribute__((unused)) OMX_IN OMX_HA
                                            __attribute__((unused)) OMX_IN OMX_BUFFERHEADERTYPE* pBuffer)
 {
   struct omx_component_t* component = (struct omx_component_t*)pAppData;
+  pthread_mutex_lock(&component->buf_mutex);
+
+  /* reset "in use" state */
+  if(pBuffer->pAppPrivate) {
+    struct omx_bufferdesc_t *pbufferdesc = (struct omx_bufferdesc_t*)pBuffer->pAppPrivate;
+    if(pbufferdesc->state != 1) {
+      fprintf(stderr, "buffer %p has unexpected state %d\n", pBuffer->pBuffer, pbufferdesc->state);
+    }
+    pbufferdesc->state = 0;
+  }
 
   if (component->buf_notempty == 0) {
-    pthread_mutex_lock(&component->buf_mutex);
     component->buf_notempty = 1;
     pthread_cond_signal(&component->buf_notempty_cv);
-    pthread_mutex_unlock(&component->buf_mutex);
   }
+  pthread_mutex_unlock(&component->buf_mutex);
   return OMX_ErrorNone;
 }
 
@@ -344,12 +353,10 @@ static void omx_disable_all_ports(struct omx_component_t* component)
   }
 }
 
-/* Based on allocbufs from omxtx.
-   Buffers are connected as a one-way linked list using pAppPrivate as the pointer to the next element */
+/* Based on allocbufs from omxtx. */
 void omx_alloc_buffers(struct omx_component_t *component, int port)
 {
-  unsigned int i;
-  OMX_BUFFERHEADERTYPE *list = NULL, **end = &list;
+  int i;
   OMX_PARAM_PORTDEFINITIONTYPE portdef;
 
   OMX_INIT_STRUCTURE(portdef);
@@ -362,43 +369,48 @@ void omx_alloc_buffers(struct omx_component_t *component, int port)
     DEBUGF("portdef.bEnabled=%d\n",portdef.bEnabled);
   }
 
-  for (i = 0; i < portdef.nBufferCountActual; i++) {
-    OMX_U8 *buf;
+  component->buffercount = portdef.nBufferCountActual;
+  component->bufferdesc = malloc(sizeof(struct omx_bufferdesc_t)*component->buffercount);
+  if(!component->bufferdesc) {
+    fprintf(stderr, "out of memory allocating buffers\n");
+  } else {
+  for (i = 0; i < component->buffercount; i++) {
+      OMX_U8 *buf;
+      buf = vcos_malloc_aligned(portdef.nBufferSize, portdef.nBufferAlignment, "buffer");
 
-    buf = vcos_malloc_aligned(portdef.nBufferSize, portdef.nBufferAlignment, "buffer");
+      //    printf("Allocated a buffer of %u bytes\n",(unsigned int)portdef.nBufferSize);
 
-    //    printf("Allocated a buffer of %u bytes\n",(unsigned int)portdef.nBufferSize);
-
-    OERR(OMX_UseBuffer(component->h, end, port, NULL, portdef.nBufferSize, buf));
-
-    end = (OMX_BUFFERHEADERTYPE **) &((*end)->pAppPrivate);
+      OERR(OMX_UseBuffer(component->h, &component->bufferdesc[i].pHeader, port, NULL, portdef.nBufferSize, buf));
+      component->bufferdesc[i].state = 0;
+      component->bufferdesc[i].pHeader->pAppPrivate = &component->bufferdesc[i];
+    }
   }
 
-  component->buffers = list;
 }
 
 void omx_free_buffers(struct omx_component_t *component, int port)
 {
-  OMX_BUFFERHEADERTYPE *buf, *prev;
-//  int i=0;
-
-  buf = component->buffers;
-  while (buf) {
-    prev = buf->pAppPrivate;
-    OERR(OMX_FreeBuffer(component->h, port, buf)); /* This also calls free() */
-    buf = prev;
+  int i=0;
+  if(component->bufferdesc) {
+    for (i = 0; i < component->buffercount; i++) {
+      OERR(OMX_FreeBuffer(component->h, port, component->bufferdesc[i].pHeader)); /* This also calls free() */
+      component->bufferdesc[i].state = 0;
+    }
+    free(component->bufferdesc);
   }
 }
 
 int omx_get_free_buffer_count(struct omx_component_t* component)
 {
   int n = 0;
-  OMX_BUFFERHEADERTYPE *buf = component->buffers;
+  int i = 0;
 
   pthread_mutex_lock(&component->buf_mutex);
-  while (buf) {
-    if (buf->nFilledLen == 0) n++;
-    buf = buf->pAppPrivate;
+  if(component->bufferdesc) {
+    for (i = 0; i < component->buffercount; i++) {
+      if(component->bufferdesc[i].state==0)
+        n++;
+    }
   }
   pthread_mutex_unlock(&component->buf_mutex);
 
@@ -425,41 +437,33 @@ static void dump_buffer_status(OMX_BUFFERHEADERTYPE *buffers)
 }
 #endif
 
-void summarise_buffers(OMX_BUFFERHEADERTYPE *buffers)
-{
-  OMX_BUFFERHEADERTYPE *buf = buffers;
-
-  fprintf(stderr,"*******\n");
-  while (buf) {
-    fprintf(stderr,"buf->nFilledLen=%u\n",(unsigned int)buf->nFilledLen);
-    buf = buf->pAppPrivate;
-  }
-}
-
-/* Return the next free buffer, or NULL if none are free */
+/* Return the next free buffer */
 OMX_BUFFERHEADERTYPE *get_next_buffer(struct omx_component_t* component)
 {
-  OMX_BUFFERHEADERTYPE *ret;
+  int i = 0;
+  OMX_BUFFERHEADERTYPE *ret = 0;
 
 retry:
   pthread_mutex_lock(&component->buf_mutex);
+  if(component->bufferdesc) {
+    for (i = 0; !ret && i < component->buffercount; i++) {
+      if(component->bufferdesc[i].state==0) {
+        ret = component->bufferdesc[i].pHeader;
+        component->bufferdesc[i].state = 1; /* mark "in use" */
+      }
+    }
 
-  ret = component->buffers;
-  while (ret && ret->nFilledLen > 0)
-    ret = ret->pAppPrivate;
+    if (!ret)
+      component->buf_notempty = 0;
 
-  if (!ret)
-    component->buf_notempty = 0;
+    if (ret) {
+      pthread_mutex_unlock(&component->buf_mutex);
+      return ret;
+    }
 
-  if (ret) {
-    pthread_mutex_unlock(&component->buf_mutex);
-    return ret;
+    while (component->buf_notempty == 0)
+       pthread_cond_wait(&component->buf_notempty_cv,&component->buf_mutex);
   }
-
-  //summarise_buffers(pi->video_buffers);
-  while (component->buf_notempty == 0)
-     pthread_cond_wait(&component->buf_notempty_cv,&component->buf_mutex);
-
   pthread_mutex_unlock(&component->buf_mutex);
 
   goto retry;
