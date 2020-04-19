@@ -37,6 +37,12 @@ extern "C" {
 //#include <ao/ao.h>
 #include "codec.h"
 #include "avcodec_omx.h"
+
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(55, 28, 1)
+#define avcodec_alloc_frame av_frame_alloc
+#define avcodec_free_frame av_frame_free
+#endif
+
 }
 /* ffmpeg buf 8k for audio */
 #define AINBUF_SIZE 0x2000
